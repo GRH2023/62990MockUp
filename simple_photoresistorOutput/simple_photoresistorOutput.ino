@@ -1,36 +1,36 @@
 #include <PubSubClient.h>
 #include <WiFi.h>
-
-#include "wifi_config.h"  // add your own the wifi.h file
+#include "wifi_config.h"  // Your WiFi credentials (ssid, password)
 
 // -------- MQTT / Network --------
-const char* mqtt_server = "192.168.0.101"; 
+const char* mqtt_server = "192.168.164.150"; 
 const int mqtt_port = 1883;
-const char* mqtt_topic = "sensor/photo";
+const char* mqtt_topic = "sensor/current";
 const char* clientBaseID = "ESP32C6_Client_";
 String resetStatusMsg = "";
 bool waitingForResetAck = false;
 
 // -------- ADC & averaging --------
-#define ADC_PIN 4            // change to your sensor pin
-const int NUM_SAMPLES = 10;  // number of samples to average
-int samples[NUM_SAMPLES];
+#define ADC_PIN 34
+const int NUM_SAMPLES = 10;  
+float samples[NUM_SAMPLES];  // store current in amps
 int sampleIndex = 0;
-long sumSamples = 0;  
+float sumSamples = 0;  
 float averageValue = 0.0;
+const float shuntResistor = 5.0;  // Ohms
 
 // -------- threshold --------
-float percentDrop = 0.0;  // no default threshold
+float percentDrop = 0.0;
 float thresholdValue = 0.0;
-bool thresholdActive = false;      // threshold inactive initially
-bool resetRequested = false;       // tracks reset button pressed
-bool thresholdNeedsReset = false;  // flag to trigger threshold recalculation
+bool thresholdActive = false;
+bool resetRequested = false;
+bool thresholdNeedsReset = false;
 
 // -------- timing --------
 unsigned long lastPublish = 0;
 const unsigned long publishInterval = 2000;  // ms
 
-// -------- mqtt objects --------
+// -------- MQTT objects --------
 WiFiClient espClient;
 PubSubClient client(espClient);
 
@@ -61,12 +61,10 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
     float v = msg.toFloat();
     if (v > 0.0 && v <= 100.0) {
       percentDrop = v;
-      thresholdActive = true;  // activate threshold on valid input
+      thresholdActive = true;
       thresholdNeedsReset = true;
       Serial.print("percentDrop set to: ");
       Serial.println(percentDrop);
-
-      // Clear reset status once new percent set
       resetStatusMsg = "ok";
       waitingForResetAck = false;
       client.publish(mqtt_topic, "ok");
@@ -74,7 +72,7 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
       Serial.println("Invalid percent value (0-100 expected).");
     }
   } else if (t.endsWith("/reset_threshold")) {
-    resetRequested = true;  // flag that reset button pressed
+    resetRequested = true;
   } else if (msg.equalsIgnoreCase("ok") && waitingForResetAck) {
     Serial.println("Reset acknowledged by client.");
     resetStatusMsg = "";
@@ -88,8 +86,8 @@ void reconnect() {
     Serial.print("Connecting to MQTT broker...");
     if (client.connect(cli.c_str())) {
       Serial.println("connected");
-      client.subscribe("sensor/photo/cmd/set_percent");
-      client.subscribe("sensor/photo/cmd/reset_threshold");
+      client.subscribe("sensor/current/cmd/set_percent");
+      client.subscribe("sensor/current/cmd/reset_threshold");
     } else {
       Serial.print("failed, rc=");
       Serial.print(client.state());
@@ -99,28 +97,34 @@ void reconnect() {
   }
 }
 
+float readCurrent() {
+  int raw = analogRead(ADC_PIN);
+  float voltage = raw * (3.3 / 4095.0);  // 12-bit ADC scale
+  return voltage / shuntResistor;        // Ohm's law
+}
+
 // ---------- setup & loop ----------
 void setup() {
   Serial.begin(115200);
-  analogReadResolution(12);  // ensure 12-bit resolution (0-4095)
+  analogReadResolution(12);
   setup_wifi();
-
   client.setServer(mqtt_server, mqtt_port);
   client.setCallback(mqttCallback);
 
+  // Fill initial buffer with current readings
   for (int i = 0; i < NUM_SAMPLES; ++i) {
-    int v = analogRead(ADC_PIN);
-    samples[i] = v;
-    sumSamples += v;
+    float current = readCurrent();
+    samples[i] = current;
+    sumSamples += current;
     delay(10);
   }
-  averageValue = (float)sumSamples / NUM_SAMPLES;
-  thresholdNeedsReset = true;  // calculate threshold on first publish
+  averageValue = sumSamples / NUM_SAMPLES;
+  thresholdNeedsReset = true;
   randomSeed(analogRead(0));
+
   resetStatusMsg = "set new threshold percentage drop";
   waitingForResetAck = true;
   client.publish(mqtt_topic, resetStatusMsg.c_str());
-
 }
 
 void loop() {
@@ -135,17 +139,16 @@ void loop() {
     thresholdActive = false;
     resetRequested = false;
     percentDrop = 0.0;
-
     resetStatusMsg = "set new threshold percentage drop";
     waitingForResetAck = true;
   }
 
-  int newSample = analogRead(ADC_PIN);
-  sumSamples = sumSamples - samples[sampleIndex] + newSample;
-  samples[sampleIndex] = newSample;
+  // Read current and update rolling average
+  float current = readCurrent();
+  sumSamples = sumSamples - samples[sampleIndex] + current;
+  samples[sampleIndex] = current;
   sampleIndex = (sampleIndex + 1) % NUM_SAMPLES;
-
-  averageValue = (float)sumSamples / NUM_SAMPLES;
+  averageValue = sumSamples / NUM_SAMPLES;
 
   if (thresholdActive && thresholdNeedsReset) {
     thresholdValue = averageValue * (1.0 - percentDrop / 100.0);
@@ -158,16 +161,16 @@ void loop() {
   if (now - lastPublish >= publishInterval) {
     lastPublish = now;
 
-    // Build JSON payload (simple manual JSON)
+    // JSON payload
     String payload = "{";
-    payload += "\"adc\":";
-    payload += String(newSample);
+    payload += "\"current\":";
+    payload += String(current, 3);
     payload += ",\"avg\":";
-    payload += String(averageValue, 2);
+    payload += String(averageValue, 3);
     payload += ",\"threshold_active\":";
     payload += thresholdActive ? "true" : "false";
     payload += ",\"threshold\":";
-    payload += thresholdActive ? String(thresholdValue, 2) : "null";
+    payload += thresholdActive ? String(thresholdValue, 3) : "null";
     payload += ",\"percentDrop\":";
     payload += String(percentDrop, 2);
     payload += ",\"reset_status\":\"";
@@ -181,9 +184,11 @@ void loop() {
       Serial.println("Publish failed");
     }
 
+    // Separate MQTT topics for easy dashboard binding
+    client.publish("sensor/current/current", String(current, 3).c_str());
+    client.publish("sensor/current/avg", String(averageValue, 3).c_str());
     if (thresholdActive) {
-      client.publish("sensor/photo/avg", String(averageValue, 2).c_str());
-      client.publish("sensor/photo/threshold", String(thresholdValue, 2).c_str());
+      client.publish("sensor/current/threshold", String(thresholdValue, 3).c_str());
     }
   }
 
